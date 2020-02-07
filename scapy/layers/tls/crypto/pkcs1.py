@@ -12,7 +12,7 @@ Ubuntu or OSX. This is why we reluctantly keep some legacy crypto here.
 """
 
 from __future__ import absolute_import
-from scapy.compat import raw, hex_bytes, bytes_hex
+from scapy.compat import bytes_encode, hex_bytes, bytes_hex
 import scapy.modules.six as six
 
 from scapy.config import conf, crypto_validator
@@ -34,8 +34,8 @@ def pkcs_os2ip(s):
     """
     OS2IP conversion function from RFC 3447.
 
-    Input : s        octet string to be converted
-    Output: n        corresponding nonnegative integer
+    :param s: octet string to be converted
+    :return: n, the corresponding nonnegative integer
     """
     return int(bytes_hex(s), 16)
 
@@ -46,9 +46,9 @@ def pkcs_i2osp(n, sLen):
     The length parameter allows the function to perform the padding needed.
     Note that the user is responsible for providing a sufficient xLen.
 
-    Input : n        nonnegative integer to be converted
-            sLen     intended length of the resulting octet string
-    Output: s        corresponding octet string
+    :param n: nonnegative integer to be converted
+    :param sLen: intended length of the resulting octet string
+    :return: corresponding octet string
     """
     # if n >= 256**sLen:
     #    raise Exception("Integer too large for provided sLen %d" % sLen)
@@ -73,7 +73,7 @@ def _legacy_pkcs1_v1_5_encode_md5_sha1(M, emLen):
     """
     Legacy method for PKCS1 v1.5 encoding with MD5-SHA1 hash.
     """
-    M = raw(M)
+    M = bytes_encode(M)
     md5_hash = hashes.Hash(_get_hash("md5"), backend=default_backend())
     md5_hash.update(M)
     sha1_hash = hashes.Hash(_get_hash("sha1"), backend=default_backend())
@@ -149,7 +149,7 @@ class _EncryptAndVerifyRSA(object):
 
     @crypto_validator
     def verify(self, M, S, t="pkcs", h="sha256", mgf=None, L=None):
-        M = raw(M)
+        M = bytes_encode(M)
         mgf = mgf or padding.MGF1
         h = _get_hash(h)
         pad = _get_padding(t, mgf, h, L)
@@ -196,7 +196,7 @@ class _DecryptAndSignRSA(object):
 
     @crypto_validator
     def sign(self, M, t="pkcs", h="sha256", mgf=None, L=None):
-        M = raw(M)
+        M = bytes_encode(M)
         mgf = mgf or padding.MGF1
         h = _get_hash(h)
         pad = _get_padding(t, mgf, h, L)
@@ -208,7 +208,7 @@ class _DecryptAndSignRSA(object):
             return self._legacy_sign_md5_sha1(M)
 
     def _legacy_sign_md5_sha1(self, M):
-        M = raw(M)
+        M = bytes_encode(M)
         k = self._modulusLen // 8
         EM = _legacy_pkcs1_v1_5_encode_md5_sha1(M, k)
         if EM is None:

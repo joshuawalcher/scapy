@@ -1,4 +1,3 @@
-#! /usr/bin/env python
 #############################################################################
 #                                                                           #
 #  inet6.py --- IPv6 support for Scapy                                      #
@@ -36,7 +35,7 @@ from time import gmtime, strftime
 from scapy.arch import get_if_hwaddr
 from scapy.as_resolvers import AS_resolver_riswhois
 from scapy.base_classes import Gen
-from scapy.compat import chb, orb, raw, plain_str
+from scapy.compat import chb, orb, raw, plain_str, bytes_encode
 from scapy.config import conf
 import scapy.consts
 from scapy.data import DLT_IPV6, DLT_RAW, DLT_RAW_ALT, ETHER_ANY, ETH_P_IPV6, \
@@ -179,8 +178,8 @@ ipv6nhcls = {0: "IPv6ExtHdrHopByHop",
              17: "UDP",
              43: "IPv6ExtHdrRouting",
              44: "IPv6ExtHdrFragment",
-             # 50: "IPv6ExtHrESP",
-             # 51: "IPv6ExtHdrAH",
+             50: "ESP",
+             51: "AH",
              58: "ICMPv6Unknown",
              59: "Raw",
              60: "IPv6ExtHdrDestOpt"}
@@ -383,7 +382,7 @@ class IPv6(_IPv6GuessPayload, Packet, IPTools):
 
         if conf.checkIPsrc and conf.checkIPaddr and not in6_ismaddr(sd):
             sd = inet_pton(socket.AF_INET6, sd)
-            ss = inet_pton(socket.AF_INET6, self.src)
+            ss = inet_pton(socket.AF_INET6, ss)
             return strxor(sd, ss) + struct.pack("B", nh) + self.payload.hashret()  # noqa: E501
         else:
             return struct.pack("B", nh) + self.payload.hashret()
@@ -493,9 +492,9 @@ class IPerror6(IPv6):
                     request_has_rh = True
                 otherup = otherup.payload
 
-            if ((ss == os and sd == od) or      # <- Basic case
-                    (ss == os and request_has_rh)):  # <- Request has a RH :
-                                                #    don't check dst address
+            if ((ss == os and sd == od) or  # < Basic case
+                    (ss == os and request_has_rh)):
+                # ^ Request has a RH : don't check dst address
 
                 # Let's deal with possible MSS Clamping
                 if (isinstance(selfup, TCP) and
@@ -564,15 +563,10 @@ def in6_chksum(nh, u, p):
     """
     As Specified in RFC 2460 - 8.1 Upper-Layer Checksums
 
-    Performs IPv6 Upper Layer checksum computation. Provided parameters are:
-    - 'nh' : value of upper layer protocol
-    - 'u'  : upper layer instance (TCP, UDP, ICMPv6*, ). Instance must be
-             provided with all under layers (IPv6 and all extension headers,
-             for example)
-    - 'p'  : the payload of the upper layer provided as a string
+    Performs IPv6 Upper Layer checksum computation.
 
-    Functions operate by filling a pseudo header class instance (PseudoIPv6)
-    with
+    This function operates by filling a pseudo header class instance
+    (PseudoIPv6) with:
     - Next Header value
     - the address of _final_ destination (if some Routing Header with non
     segleft field is present in underlayer classes, last address is used.)
@@ -581,6 +575,12 @@ def in6_chksum(nh, u, p):
     in HAO option if some Destination Option header found in underlayer
     includes this option).
     - the length is the length of provided payload string ('p')
+
+    :param nh: value of upper layer protocol
+    :param u: upper layer instance (TCP, UDP, ICMPv6*, ). Instance must be
+        provided with all under layers (IPv6 and all extension headers,
+        for example)
+    :param p: the payload of the upper layer provided as a string
     """
 
     ph6 = PseudoIPv6()
@@ -966,9 +966,12 @@ class IPv6ExtHdrSegmentRouting(_IPv6ExtHdr):
                    BitField("unused2", 0, 3),
                    ShortField("tag", 0),
                    IP6ListField("addresses", ["::1"],
-                                count_from=lambda pkt: pkt.lastentry),
-                   PacketListField("tlv_objects", [], IPv6ExtHdrSegmentRoutingTLV,  # noqa: E501
-                                   length_from=lambda pkt: 8 * pkt.len - 16 * pkt.lastentry)]  # noqa: E501
+                                count_from=lambda pkt: (pkt.lastentry + 1)),
+                   PacketListField("tlv_objects", [],
+                                   IPv6ExtHdrSegmentRoutingTLV,
+                                   length_from=lambda pkt: 8 * pkt.len - 16 * (
+                                       pkt.lastentry + 1
+                   ))]
 
     overload_fields = {IPv6: {"nh": 43}}
 
@@ -979,7 +982,7 @@ class IPv6ExtHdrSegmentRouting(_IPv6ExtHdr):
             # The extension must be align on 8 bytes
             tmp_mod = (len(pkt) - 8) % 8
             if tmp_mod == 1:
-                warning("IPv6ExtHdrSegmentRouting(): can't pad 1 byte !")
+                warning("IPv6ExtHdrSegmentRouting(): can't pad 1 byte!")
             elif tmp_mod >= 2:
                 # Add the padding extension
                 tmp_pad = b"\x00" * (tmp_mod - 2)
@@ -996,7 +999,14 @@ class IPv6ExtHdrSegmentRouting(_IPv6ExtHdr):
             pkt = pkt[:3] + struct.pack("B", tmp_len) + pkt[4:]
 
         if self.lastentry is None:
-            pkt = pkt[:4] + struct.pack("B", len(self.addresses)) + pkt[5:]
+            lastentry = len(self.addresses)
+            if lastentry == 0:
+                warning(
+                    "IPv6ExtHdrSegmentRouting(): the addresses list is empty!"
+                )
+            else:
+                lastentry -= 1
+            pkt = pkt[:4] + struct.pack("B", lastentry) + pkt[5:]
 
         return _IPv6ExtHdr.post_build(self, pkt, pay)
 
@@ -1031,7 +1041,6 @@ def defragment6(packets):
     lst = [x for x in lst if x[IPv6ExtHdrFragment].id == id]
     if len(lst) != llen:
         warning("defragment6: some fragmented packets have been removed from list")  # noqa: E501
-    llen = len(lst)
 
     # reorder fragments
     res = []
@@ -1060,6 +1069,7 @@ def defragment6(packets):
     q = res[0]
     nh = q[IPv6ExtHdrFragment].nh
     q[IPv6ExtHdrFragment].underlayer.nh = nh
+    q[IPv6ExtHdrFragment].underlayer.plen = len(fragmentable)
     del q[IPv6ExtHdrFragment].underlayer.payload
     q /= conf.raw_layer(load=fragmentable)
     del(q.plen)
@@ -1155,48 +1165,6 @@ def fragment6(pkt, fragSize):
             res.append(tempo)
             break
     return res
-
-
-#                               AH Header                                   #
-
-# class _AHFieldLenField(FieldLenField):
-#     def getfield(self, pkt, s):
-#         l = getattr(pkt, self.fld)
-#         l = (l*8)-self.shift
-#         i = self.m2i(pkt, s[:l])
-#         return s[l:],i
-
-# class _AHICVStrLenField(StrLenField):
-#     def i2len(self, pkt, x):
-
-
-# class IPv6ExtHdrAH(_IPv6ExtHdr):
-#     name = "IPv6 Extension Header - AH"
-#     fields_desc = [ ByteEnumField("nh", 59, ipv6nh),
-#                     _AHFieldLenField("len", None, "icv"),
-#                     ShortField("res", 0),
-#                     IntField("spi", 0),
-#                     IntField("sn", 0),
-#                     _AHICVStrLenField("icv", None, "len", shift=2) ]
-#     overload_fields = {IPv6: { "nh": 51 }}
-
-#     def post_build(self, pkt, pay):
-#         if self.len is None:
-#             pkt = pkt[0]+struct.pack("!B", 2*len(self.addresses))+pkt[2:]
-#         if self.segleft is None:
-#             pkt = pkt[:3]+struct.pack("!B", len(self.addresses))+pkt[4:]
-#         return _IPv6ExtHdr.post_build(self, pkt, pay)
-
-
-#                               ESP Header                                  #
-
-# class IPv6ExtHdrESP(_IPv6extHdr):
-#     name = "IPv6 Extension Header - ESP"
-#     fields_desc = [ IntField("spi", 0),
-#                     IntField("sn", 0),
-#                     # there is things to extract from IKE work
-#                     ]
-#     overloads_fields = {IPv6: { "nh": 50 }}
 
 
 #############################################################################
@@ -1380,9 +1348,12 @@ class ICMPv6TimeExceeded(_ICMPv6Error):
 class ICMPv6ParamProblem(_ICMPv6Error):
     name = "ICMPv6 Parameter Problem"
     fields_desc = [ByteEnumField("type", 4, icmp6types),
-                   ByteEnumField("code", 0, {0: "erroneous header field encountered",  # noqa: E501
-                                             1: "unrecognized Next Header type encountered",  # noqa: E501
-                                             2: "unrecognized IPv6 option encountered"}),  # noqa: E501
+                   ByteEnumField(
+                       "code", 0,
+                       {0: "erroneous header field encountered",
+                        1: "unrecognized Next Header type encountered",
+                        2: "unrecognized IPv6 option encountered",
+                        3: "first fragment has incomplete header chain"}),
                    XShortField("cksum", None),
                    IntField("ptr", 6)]
 
@@ -2064,7 +2035,7 @@ class ICMPv6ND_NS(_ICMPv6NDGuessPayload, _ICMPv6, Packet):
         return self.sprintf("%name% (tgt: %tgt%)")
 
     def hashret(self):
-        return raw(self.tgt) + self.payload.hashret()
+        return bytes_encode(self.tgt) + self.payload.hashret()
 
 
 class ICMPv6ND_NA(_ICMPv6NDGuessPayload, _ICMPv6, Packet):
@@ -2083,7 +2054,7 @@ class ICMPv6ND_NA(_ICMPv6NDGuessPayload, _ICMPv6, Packet):
         return self.sprintf("%name% (tgt: %tgt%)")
 
     def hashret(self):
-        return raw(self.tgt) + self.payload.hashret()
+        return bytes_encode(self.tgt) + self.payload.hashret()
 
     def answers(self, other):
         return isinstance(other, ICMPv6ND_NS) and self.tgt == other.tgt
@@ -2178,7 +2149,7 @@ icmp6_niqtypes = {0: "NOOP",
 
 class _ICMPv6NIHashret:
     def hashret(self):
-        return raw(self.nonce)
+        return bytes_encode(self.nonce)
 
 
 class _ICMPv6NIAnswers:
@@ -3005,12 +2976,12 @@ class _MobilityHeader(Packet):
         tmp_len = self.len
         if self.len is None:
             tmp_len = (len(p) - 8) // 8
-        p = chb(p[0]) + struct.pack("B", tmp_len) + chb(p[2:])
+        p = p[:1] + struct.pack("B", tmp_len) + p[2:]
         if self.cksum is None:
             cksum = in6_chksum(135, self.underlayer, p)
         else:
             cksum = self.cksum
-        p = chb(p[:4]) + struct.pack("!H", cksum) + chb(p[6:])
+        p = p[:4] + struct.pack("!H", cksum) + p[6:]
         return p
 
 
@@ -3060,7 +3031,7 @@ class MIP6MH_HoTI(_MobilityHeader):
     overload_fields = {IPv6: {"nh": 135}}
 
     def hashret(self):
-        return raw(self.cookie)
+        return bytes_encode(self.cookie)
 
 
 class MIP6MH_CoTI(MIP6MH_HoTI):
@@ -3068,7 +3039,7 @@ class MIP6MH_CoTI(MIP6MH_HoTI):
     mhtype = 2
 
     def hashret(self):
-        return raw(self.cookie)
+        return bytes_encode(self.cookie)
 
 
 class MIP6MH_HoT(_MobilityHeader):
@@ -3087,7 +3058,7 @@ class MIP6MH_HoT(_MobilityHeader):
     overload_fields = {IPv6: {"nh": 135}}
 
     def hashret(self):
-        return raw(self.cookie)
+        return bytes_encode(self.cookie)
 
     def answers(self, other):
         if (isinstance(other, MIP6MH_HoTI) and
@@ -3101,7 +3072,7 @@ class MIP6MH_CoT(MIP6MH_HoT):
     mhtype = 4
 
     def hashret(self):
-        return raw(self.cookie)
+        return bytes_encode(self.cookie)
 
     def answers(self, other):
         if (isinstance(other, MIP6MH_CoTI) and
@@ -4016,9 +3987,7 @@ bind_layers(Ether, IPv6, type=0x86dd)
 bind_layers(CookedLinux, IPv6, proto=0x86dd)
 bind_layers(GRE, IPv6, proto=0x86dd)
 bind_layers(SNAP, IPv6, code=0x86dd)
-bind_layers(Loopback, IPv6, type=0x18)
-bind_layers(Loopback, IPv6, type=0x1c)
-bind_layers(Loopback, IPv6, type=0x1e)
+bind_layers(Loopback, IPv6, type=socket.AF_INET6)
 bind_layers(IPerror6, TCPerror, nh=socket.IPPROTO_TCP)
 bind_layers(IPerror6, UDPerror, nh=socket.IPPROTO_UDP)
 bind_layers(IPv6, TCP, nh=socket.IPPROTO_TCP)

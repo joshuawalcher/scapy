@@ -12,12 +12,17 @@ Generators and packet meta classes.
 ################
 
 from __future__ import absolute_import
+
+from functools import reduce
 import operator
+import os
 import re
 import random
 import socket
+import subprocess
 import types
-from functools import reduce
+
+from scapy.consts import WINDOWS
 from scapy.modules.six.moves import range
 
 
@@ -122,11 +127,19 @@ class Net(Gen):
         return "Net(%r)" % self.repr
 
     def __eq__(self, other):
+        if not other:
+            return False
         if hasattr(other, "parsed"):
             p2 = other.parsed
         else:
             p2, nm2 = self._parse_net(other)
         return self.parsed == p2
+
+    def __ne__(self, other):
+        # Python 2.7 compat
+        return not self == other
+
+    __hash__ = None
 
     def __contains__(self, other):
         if hasattr(other, "parsed"):
@@ -261,29 +274,6 @@ class Field_metaclass(type):
         return newcls
 
 
-class NewDefaultValues(Packet_metaclass):
-    """NewDefaultValues is deprecated (not needed anymore)
-
-    remove this:
-        __metaclass__ = NewDefaultValues
-    and it should still work.
-    """
-    def __new__(cls, name, bases, dct):
-        from scapy.error import log_loading
-        import traceback
-        try:
-            for tb in traceback.extract_stack() + [("??", -1, None, "")]:
-                f, l, _, line = tb
-                if line.startswith("class"):
-                    break
-        except Exception:
-            f, l = "??", -1  # noqa: E741
-            raise
-        log_loading.warning("Deprecated (no more needed) use of NewDefaultValues  (%s l. %i).", f, l)  # noqa: E501
-
-        return super(NewDefaultValues, cls).__new__(cls, name, bases, dct)
-
-
 class BasePacket(Gen):
     __slots__ = []
 
@@ -294,3 +284,77 @@ class BasePacket(Gen):
 
 class BasePacketList(object):
     __slots__ = []
+
+
+class _CanvasDumpExtended(object):
+    def psdump(self, filename=None, **kargs):
+        """
+        psdump(filename=None, layer_shift=0, rebuild=1)
+
+        Creates an EPS file describing a packet. If filename is not provided a
+        temporary file is created and gs is called.
+
+        :param filename: the file's filename
+        """
+        from scapy.config import conf
+        from scapy.utils import get_temp_file, ContextManagerSubprocess
+        canvas = self.canvas_dump(**kargs)
+        if filename is None:
+            fname = get_temp_file(autoext=kargs.get("suffix", ".eps"))
+            canvas.writeEPSfile(fname)
+            if WINDOWS and conf.prog.psreader is None:
+                os.startfile(fname)
+            else:
+                with ContextManagerSubprocess(conf.prog.psreader):
+                    subprocess.Popen([conf.prog.psreader, fname])
+        else:
+            canvas.writeEPSfile(filename)
+        print()
+
+    def pdfdump(self, filename=None, **kargs):
+        """
+        pdfdump(filename=None, layer_shift=0, rebuild=1)
+
+        Creates a PDF file describing a packet. If filename is not provided a
+        temporary file is created and xpdf is called.
+
+        :param filename: the file's filename
+        """
+        from scapy.config import conf
+        from scapy.utils import get_temp_file, ContextManagerSubprocess
+        canvas = self.canvas_dump(**kargs)
+        if filename is None:
+            fname = get_temp_file(autoext=kargs.get("suffix", ".pdf"))
+            canvas.writePDFfile(fname)
+            if WINDOWS and conf.prog.pdfreader is None:
+                os.startfile(fname)
+            else:
+                with ContextManagerSubprocess(conf.prog.pdfreader):
+                    subprocess.Popen([conf.prog.pdfreader, fname])
+        else:
+            canvas.writePDFfile(filename)
+        print()
+
+    def svgdump(self, filename=None, **kargs):
+        """
+        svgdump(filename=None, layer_shift=0, rebuild=1)
+
+        Creates an SVG file describing a packet. If filename is not provided a
+        temporary file is created and gs is called.
+
+        :param filename: the file's filename
+        """
+        from scapy.config import conf
+        from scapy.utils import get_temp_file, ContextManagerSubprocess
+        canvas = self.canvas_dump(**kargs)
+        if filename is None:
+            fname = get_temp_file(autoext=kargs.get("suffix", ".svg"))
+            canvas.writeSVGfile(fname)
+            if WINDOWS and conf.prog.svgreader is None:
+                os.startfile(fname)
+            else:
+                with ContextManagerSubprocess(conf.prog.svgreader):
+                    subprocess.Popen([conf.prog.svgreader, fname])
+        else:
+            canvas.writeSVGfile(filename)
+        print()

@@ -24,11 +24,11 @@ from scapy.data import IPV6_ADDR_GLOBAL, IPV6_ADDR_LINKLOCAL, \
     IPV6_ADDR_SITELOCAL, IPV6_ADDR_LOOPBACK, IPV6_ADDR_UNICAST,\
     IPV6_ADDR_MULTICAST, IPV6_ADDR_6TO4, IPV6_ADDR_UNSPECIFIED
 from scapy.utils import strxor
-from scapy.compat import orb, chb, cmp_to_key
+from scapy.compat import orb, chb
 from scapy.pton_ntop import inet_pton, inet_ntop
 from scapy.volatile import RandMAC
 from scapy.error import warning, Scapy_Exception
-from functools import reduce
+from functools import reduce, cmp_to_key
 from scapy.modules.six.moves import range, zip
 
 
@@ -269,7 +269,7 @@ def in6_addrtovendor(addr):
     unknown.
     """
     mac = in6_addrtomac(addr)
-    if mac is None or conf.manufdb is None:
+    if mac is None or not conf.manufdb:
         return None
 
     res = conf.manufdb._get_manuf(mac)
@@ -406,12 +406,12 @@ def in6_getRandomizedIfaceId(ifaceid, previous=None):
     value (for possible future use). Input and output values are provided in
     a "printable" format as depicted below.
 
-    ex:
-    >>> in6_getRandomizedIfaceId('20b:93ff:feeb:2d3')
-    ('4c61:76ff:f46a:a5f3', 'd006:d540:db11:b092')
-    >>> in6_getRandomizedIfaceId('20b:93ff:feeb:2d3',
-                                 previous='d006:d540:db11:b092')
-    ('fe97:46fe:9871:bd38', 'eeed:d79c:2e3f:62e')
+    ex::
+        >>> in6_getRandomizedIfaceId('20b:93ff:feeb:2d3')
+        ('4c61:76ff:f46a:a5f3', 'd006:d540:db11:b092')
+        >>> in6_getRandomizedIfaceId('20b:93ff:feeb:2d3',
+                                     previous='d006:d540:db11:b092')
+        ('fe97:46fe:9871:bd38', 'eeed:d79c:2e3f:62e')
     """
 
     s = b""
@@ -525,7 +525,7 @@ def teredoAddrExtractInfo(x):
 def in6_iseui64(x):
     """
     Return True if provided address has an interface identifier part
-    created in modified EUI-64 format (meaning it matches *::*:*ff:fe*:*).
+    created in modified EUI-64 format (meaning it matches ``*::*:*ff:fe*:*``).
     Otherwise, False is returned. Address must be passed in printable
     format.
     """
@@ -882,7 +882,7 @@ class Net6(Gen):  # syntax ex. fec0::/126
                                for i in range(*self.parsed[n])
                                for y in l])
 
-        return iter(rec(0, ['']))
+        return (in6_ptop(addr) for addr in iter(rec(0, [''])))
 
     def __iterlen__(self):
         self._parse()
@@ -898,7 +898,9 @@ class Net6(Gen):  # syntax ex. fec0::/126
         return str(other) == str(self)
 
     def __ne__(self, other):
-        return str(other) != str(self)
+        return not self == other
+
+    __hash__ = None
 
     def __repr__(self):
         return "Net6(%r)" % self.repr

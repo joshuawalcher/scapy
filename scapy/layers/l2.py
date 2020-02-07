@@ -21,14 +21,17 @@ from scapy.compat import chb, orb
 from scapy.config import conf
 from scapy import consts
 from scapy.data import ARPHDR_ETHER, ARPHDR_LOOPBACK, ARPHDR_METRICOM, \
-    DLT_LINUX_IRDA, DLT_LINUX_SLL, DLT_LOOP, DLT_NULL, ETHER_ANY, \
-    ETHER_BROADCAST, ETHER_TYPES, ETH_P_ARP, ETH_P_MACSEC
-from scapy.error import warning
+    DLT_ETHERNET_MPACKET, DLT_LINUX_IRDA, DLT_LINUX_SLL, DLT_LOOP, \
+    DLT_NULL, ETHER_ANY, ETHER_BROADCAST, ETHER_TYPES, ETH_P_ARP, \
+    ETH_P_MACSEC
+from scapy.error import warning, ScapyNoDstMacException
 from scapy.fields import BCDFloatField, BitField, ByteField, \
-    ConditionalField, EnumField, FieldLenField, IntField, IP6Field, IPField, \
-    LenField, MACField, MultipleTypeField, ShortEnumField, ShortField, \
-    SourceIP6Field, SourceIPField, StrFixedLenField, StrLenField, \
-    X3BytesField, XByteField, XIntField, XShortEnumField, XShortField
+    ConditionalField, FieldLenField, FCSField, \
+    IntEnumField, IntField, IP6Field, IPField, \
+    LenField, MACField, MultipleTypeField, \
+    ShortEnumField, ShortField, SourceIP6Field, SourceIPField, \
+    StrFixedLenField, StrLenField, X3BytesField, XByteField, XIntField, \
+    XShortEnumField, XShortField
 from scapy.modules.six import viewitems
 from scapy.packet import bind_layers, Packet
 from scapy.plist import PacketList, SndRcvList
@@ -71,7 +74,7 @@ def getmacbyip(ip, chainCC=0):
     """Return MAC address corresponding to a given IP address"""
     if isinstance(ip, Net):
         ip = next(iter(ip))
-    ip = inet_ntoa(inet_aton(ip))
+    ip = inet_ntoa(inet_aton(ip or "0.0.0.0"))
     tmp = [orb(e) for e in inet_aton(ip)]
     if (tmp[0] & 0xf0) == 0xe0:  # mcast @
         return "01:00:5e:%.2x:%.2x:%.2x" % (tmp[1] & 0x7f, tmp[2], tmp[3])
@@ -85,13 +88,17 @@ def getmacbyip(ip, chainCC=0):
     if mac:
         return mac
 
-    res = srp1(Ether(dst=ETHER_BROADCAST) / ARP(op="who-has", pdst=ip),
-               type=ETH_P_ARP,
-               iface=iff,
-               timeout=2,
-               verbose=0,
-               chainCC=chainCC,
-               nofilter=1)
+    try:
+        res = srp1(Ether(dst=ETHER_BROADCAST) / ARP(op="who-has", pdst=ip),
+                   type=ETH_P_ARP,
+                   iface=iff,
+                   timeout=2,
+                   verbose=0,
+                   chainCC=chainCC,
+                   nofilter=1)
+    except Exception as ex:
+        warning("getmacbyip failed on %s" % ex)
+        return None
     if res is not None:
         mac = res.payload.hwsrc
         conf.netcache.arp_cache[ip] = mac
@@ -112,8 +119,11 @@ class DestMACField(MACField):
             except socket.error:
                 pass
             if x is None:
-                x = "ff:ff:ff:ff:ff:ff"
-                warning("Mac address to reach destination not found. Using broadcast.")  # noqa: E501
+                if conf.raise_no_dst_mac:
+                    raise ScapyNoDstMacException()
+                else:
+                    x = "ff:ff:ff:ff:ff:ff"
+                    warning("Mac address to reach destination not found. Using broadcast.")  # noqa: E501
         return MACField.i2h(self, pkt, x)
 
     def i2m(self, pkt, x):
@@ -125,8 +135,7 @@ class SourceMACField(MACField):
 
     def __init__(self, name, getif=None):
         MACField.__init__(self, name, None)
-        self.getif = ((lambda pkt: pkt.payload.route()[0])
-                      if getif is None else getif)
+        self.getif = (lambda pkt: pkt.route()[0]) if getif is None else getif
 
     def i2h(self, pkt, x):
         if x is None:
@@ -144,11 +153,6 @@ class SourceMACField(MACField):
 
     def i2m(self, pkt, x):
         return MACField.i2m(self, pkt, self.i2h(pkt, x))
-
-
-class ARPSourceMACField(SourceMACField):
-    def __init__(self, name):
-        super(ARPSourceMACField, self).__init__(name)
 
 
 # Layers
@@ -187,7 +191,7 @@ class Ether(Packet):
 class Dot3(Packet):
     name = "802.3"
     fields_desc = [DestMACField("dst"),
-                   MACField("src", ETHER_ANY),
+                   SourceMACField("src"),
                    LenField("len", None, "H")]
 
     def extract_padding(self, s):
@@ -238,6 +242,13 @@ class CookedLinux(Packet):
                    ShortField("lladdrlen", 0),
                    StrFixedLenField("src", "", 8),
                    XShortEnumField("proto", 0x800, ETHER_TYPES)]
+
+
+class MPacketPreamble(Packet):
+    # IEEE 802.3br Figure 99-3
+    name = "MPacket Preamble"
+    fields_desc = [StrFixedLenField("preamble", b"", length=8),
+                   FCSField("fcs", 0, fmt="!I")]
 
 
 class SNAP(Packet):
@@ -324,7 +335,7 @@ class ARP(Packet):
         }),
         MultipleTypeField(
             [
-                (ARPSourceMACField("hwsrc"),
+                (SourceMACField("hwsrc"),
                  (lambda pkt: pkt.hwtype == 1 and pkt.hwlen == 6,
                   lambda pkt, val: pkt.hwtype == 1 and (
                       pkt.hwlen == 6 or (pkt.hwlen is None and
@@ -398,10 +409,16 @@ class ARP(Packet):
         return self_psrc[:len(other_pdst)] == other_pdst[:len(self_psrc)]
 
     def route(self):
-        dst = self.pdst
+        fld, dst = self.getfield_and_val("pdst")
+        fld, dst = fld._find_fld_pkt_val(self, dst)
         if isinstance(dst, Gen):
             dst = next(iter(dst))
-        return conf.route.route(dst)
+        if isinstance(fld, IP6Field):
+            return conf.route6.route(dst)
+        elif isinstance(fld, IPField):
+            return conf.route.route(dst)
+        else:
+            return None, None, None
 
     def extract_padding(self, s):
         return "", s
@@ -421,6 +438,19 @@ def l2_register_l3_arp(l2, l3):
 conf.neighbor.register_l3(Ether, ARP, l2_register_l3_arp)
 
 
+class ERSPAN(Packet):
+    name = "ERSPAN"
+    fields_desc = [BitField("ver", 0, 4),
+                   BitField("vlan", 0, 12),
+                   BitField("cos", 0, 3),
+                   BitField("en", 0, 2),
+                   BitField("t", 0, 1),
+                   BitField("session_id", 0, 10),
+                   BitField("reserved", 0, 12),
+                   BitField("index", 0, 20),
+                   ]
+
+
 class GRErouting(Packet):
     name = "GRE routing information"
     fields_desc = [ShortField("address_family", 0),
@@ -432,6 +462,9 @@ class GRErouting(Packet):
 
 class GRE(Packet):
     name = "GRE"
+    deprecated_fields = {
+        "seqence_number": ("sequence_number", "2.4.4"),
+    }
     fields_desc = [BitField("chksum_present", 0, 1),
                    BitField("routing_present", 0, 1),
                    BitField("key_present", 0, 1),
@@ -444,7 +477,7 @@ class GRE(Packet):
                    ConditionalField(XShortField("chksum", None), lambda pkt:pkt.chksum_present == 1 or pkt.routing_present == 1),  # noqa: E501
                    ConditionalField(XShortField("offset", None), lambda pkt:pkt.chksum_present == 1 or pkt.routing_present == 1),  # noqa: E501
                    ConditionalField(XIntField("key", None), lambda pkt:pkt.key_present == 1),  # noqa: E501
-                   ConditionalField(XIntField("seqence_number", None), lambda pkt:pkt.seqnum_present == 1),  # noqa: E501
+                   ConditionalField(XIntField("sequence_number", None), lambda pkt:pkt.seqnum_present == 1),  # noqa: E501
                    ]
 
     @classmethod
@@ -469,6 +502,9 @@ class GRE_PPTP(GRE):
     """
 
     name = "GRE PPTP"
+    deprecated_fields = {
+        "seqence_number": ("sequence_number", "2.4.4"),
+    }
     fields_desc = [BitField("chksum_present", 0, 1),
                    BitField("routing_present", 0, 1),
                    BitField("key_present", 1, 1),
@@ -481,7 +517,7 @@ class GRE_PPTP(GRE):
                    XShortEnumField("proto", 0x880b, ETHER_TYPES),
                    ShortField("payload_len", None),
                    ShortField("call_id", None),
-                   ConditionalField(XIntField("seqence_number", None), lambda pkt: pkt.seqnum_present == 1),  # noqa: E501
+                   ConditionalField(XIntField("sequence_number", None), lambda pkt: pkt.seqnum_present == 1),  # noqa: E501
                    ConditionalField(XIntField("ack_number", None), lambda pkt: pkt.acknum_present == 1)]  # noqa: E501
 
     def post_build(self, p, pay):
@@ -494,9 +530,7 @@ class GRE_PPTP(GRE):
 
 # *BSD loopback layer
 
-class LoIntEnumField(EnumField):
-    def __init__(self, name, default, enum):
-        EnumField.__init__(self, name, default, enum, "!I")
+class LoIntEnumField(IntEnumField):
 
     def m2i(self, pkt, x):
         return x >> 24
@@ -515,10 +549,13 @@ LOOPBACK_TYPES = {0x2: "IPv4",
 
 
 class Loopback(Packet):
-    """*BSD loopback layer"""
+    r"""\*BSD loopback layer"""
 
     name = "Loopback"
-    fields_desc = [LoIntEnumField("type", 0x2, LOOPBACK_TYPES)]
+    if consts.OPENBSD:
+        fields_desc = [IntEnumField("type", 0x2, LOOPBACK_TYPES)]
+    else:
+        fields_desc = [LoIntEnumField("type", 0x2, LOOPBACK_TYPES)]
     __slots__ = ["_defrag_pos"]
 
 
@@ -526,7 +563,7 @@ class Dot1AD(Dot1Q):
     name = '802_1AD'
 
 
-bind_layers(Dot3, LLC,)
+bind_layers(Dot3, LLC)
 bind_layers(Ether, LLC, type=122)
 bind_layers(Ether, LLC, type=34928)
 bind_layers(Ether, Dot1Q, type=33024)
@@ -534,6 +571,7 @@ bind_layers(Ether, Dot1AD, type=0x88a8)
 bind_layers(Dot1AD, Dot1AD, type=0x88a8)
 bind_layers(Dot1AD, Dot1Q, type=0x8100)
 bind_layers(Dot1Q, Dot1AD, type=0x88a8)
+bind_layers(ERSPAN, Ether)
 bind_layers(Ether, Ether, type=1)
 bind_layers(Ether, ARP, type=2054)
 bind_layers(CookedLinux, LLC, proto=122)
@@ -541,14 +579,16 @@ bind_layers(CookedLinux, Dot1Q, proto=33024)
 bind_layers(CookedLinux, Dot1AD, type=0x88a8)
 bind_layers(CookedLinux, Ether, proto=1)
 bind_layers(CookedLinux, ARP, proto=2054)
+bind_layers(MPacketPreamble, Ether)
 bind_layers(GRE, LLC, proto=122)
 bind_layers(GRE, Dot1Q, proto=33024)
 bind_layers(GRE, Dot1AD, type=0x88a8)
 bind_layers(GRE, Ether, proto=0x6558)
 bind_layers(GRE, ARP, proto=2054)
+bind_layers(GRE, ERSPAN, proto=0x88be, seqnum_present=1)
 bind_layers(GRE, GRErouting, {"routing_present": 1})
 bind_layers(GRErouting, conf.raw_layer, {"address_family": 0, "SRE_len": 0})
-bind_layers(GRErouting, GRErouting, {})
+bind_layers(GRErouting, GRErouting)
 bind_layers(LLC, STP, dsap=66, ssap=66, ctrl=3)
 bind_layers(LLC, SNAP, dsap=170, ssap=170, ctrl=3)
 bind_layers(SNAP, Dot1Q, code=33024)
@@ -562,6 +602,7 @@ conf.l2types.register_num2layer(ARPHDR_METRICOM, Ether)
 conf.l2types.register_num2layer(ARPHDR_LOOPBACK, Ether)
 conf.l2types.register_layer2num(ARPHDR_ETHER, Dot3)
 conf.l2types.register(DLT_LINUX_SLL, CookedLinux)
+conf.l2types.register(DLT_ETHERNET_MPACKET, MPacketPreamble)
 conf.l2types.register_num2layer(DLT_LINUX_IRDA, CookedLinux)
 conf.l2types.register(DLT_LOOP, Loopback)
 conf.l2types.register_num2layer(DLT_NULL, Loopback)
@@ -594,8 +635,21 @@ class ARPingResult(SndRcvList):
         SndRcvList.__init__(self, res, name, stats)
 
     def show(self):
+        """
+        Print the list of discovered MAC addresses.
+        """
+
+        data = list()
+        padding = 0
+
         for s, r in self.res:
-            print(r.sprintf("%19s,Ether.src% %ARP.psrc%"))
+            manuf = conf.manufdb._get_short_manuf(r.src)
+            manuf = "unknown" if manuf == r.src else manuf
+            padding = max(padding, len(manuf))
+            data.append((r[Ether].src, manuf, r[ARP].psrc))
+
+        for src, manuf, psrc in data:
+            print("  %-17s %-*s %s" % (src, padding, manuf, psrc))
 
 
 @conf.commands.register
@@ -612,7 +666,7 @@ Set cache=True if you want arping to modify internal ARP-Cache"""
     if cache and ans is not None:
         for pair in ans:
             conf.netcache.arp_cache[pair[1].psrc] = (pair[1].hwsrc, time.time())  # noqa: E501
-    if verbose:
+    if ans is not None and verbose:
         ans.show()
     return ans, unans
 
@@ -643,16 +697,24 @@ class ARP_am(AnsweringMachine):
 
     example:
     To respond to an ARP request for 192.168.100 replying on the
-    ingress interface;
+    ingress interface::
+
       farpd(IP_addr='192.168.1.100',ARP_addr='00:01:02:03:04:05')
-    To respond on a different interface add the interface parameter
+
+    To respond on a different interface add the interface parameter::
+
       farpd(IP_addr='192.168.1.100',ARP_addr='00:01:02:03:04:05',iface='eth0')
-    To respond on ANY arp request on an interface with mac address ARP_addr
+
+    To respond on ANY arp request on an interface with mac address ARP_addr::
+
       farpd(ARP_addr='00:01:02:03:04:05',iface='eth1')
-    To respond on ANY arp request with my mac addr on the given interface
+
+    To respond on ANY arp request with my mac addr on the given interface::
+
       farpd(iface='eth1')
 
-    Optional Args
+    Optional Args::
+
      inter=<n>   Interval in seconds between ARP replies being sent
 
     """
@@ -684,7 +746,6 @@ class ARP_am(AnsweringMachine):
                 ARP_addr = get_if_hwaddr(iff)
             except Exception:
                 ARP_addr = "00:00:00:00:00:00"
-                pass
         else:
             ARP_addr = self.ARP_addr
         resp = Ether(dst=ether.src,

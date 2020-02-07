@@ -11,7 +11,7 @@ Basic Encoding Rules (BER) for ASN.1
 
 from __future__ import absolute_import
 from scapy.error import warning
-from scapy.compat import chb, orb, raw
+from scapy.compat import chb, orb, bytes_encode
 from scapy.utils import binrepr, inet_aton, inet_ntoa
 from scapy.asn1.asn1 import ASN1_Decoding_Error, ASN1_Encoding_Error, \
     ASN1_BadTag_Decoding_Error, ASN1_Codecs, ASN1_Class_UNIVERSAL, \
@@ -264,7 +264,7 @@ class BERcodec_Object(six.with_metaclass(BERcodec_metaclass)):
         if context is None:
             context = cls.tag.context
         cls.check_string(s)
-        p, _ = BER_id_dec(s)
+        p, remainder = BER_id_dec(s)
         if p not in context:
             t = s
             if len(t) > 18:
@@ -272,6 +272,10 @@ class BERcodec_Object(six.with_metaclass(BERcodec_metaclass)):
             raise BER_Decoding_Error("Unknown prefix [%02x] for [%r]" %
                                      (p, t), remaining=s)
         codec = context[p].get_codec(ASN1_Codecs.BER)
+        if codec == BERcodec_Object:
+            # Value type defined as Unknown
+            l, s = BER_num_dec(remainder)
+            return ASN1_BADTAG(s[:l]), s[l:]
         return codec.dec(s, context, safe)
 
     @classmethod
@@ -294,7 +298,7 @@ class BERcodec_Object(six.with_metaclass(BERcodec_metaclass)):
 
     @classmethod
     def enc(cls, s):
-        if isinstance(s, six.string_types):
+        if isinstance(s, six.string_types + (bytes,)):
             return BERcodec_STRING.enc(s)
         else:
             return BERcodec_INTEGER.enc(int(s))
@@ -373,7 +377,7 @@ class BERcodec_BIT_STRING(BERcodec_Object):
     @classmethod
     def enc(cls, s):
         # /!\ this is DER encoding (bit strings are only zero-bit padded)
-        s = raw(s)
+        s = bytes_encode(s)
         if len(s) % 8 == 0:
             unused_bits = 0
         else:
@@ -390,7 +394,7 @@ class BERcodec_STRING(BERcodec_Object):
 
     @classmethod
     def enc(cls, s):
-        s = raw(s)
+        s = bytes_encode(s)
         # Be sure we are encoding bytes
         return chb(hash(cls.tag)) + BER_len_enc(len(s)) + s
 
@@ -416,7 +420,7 @@ class BERcodec_OID(BERcodec_Object):
 
     @classmethod
     def enc(cls, oid):
-        oid = raw(oid)
+        oid = bytes_encode(oid)
         if oid:
             lst = [int(x) for x in oid.strip(b".").split(b".")]
         else:

@@ -9,6 +9,7 @@ SuperSocket.
 
 from __future__ import absolute_import
 from select import select, error as select_error
+import ctypes
 import errno
 import os
 import socket
@@ -17,13 +18,15 @@ import time
 
 from scapy.config import conf
 from scapy.consts import LINUX, DARWIN, WINDOWS
-from scapy.data import MTU, ETH_P_IP
-from scapy.compat import raw
+from scapy.data import MTU, ETH_P_IP, SOL_PACKET, SO_TIMESTAMPNS
+from scapy.compat import raw, bytes_encode
 from scapy.error import warning, log_runtime
 import scapy.modules.six as six
 import scapy.packet
 from scapy.utils import PcapReader, tcpdump
 
+
+# Utils
 
 class _SuperSocket_metaclass(type):
     def __repr__(self):
@@ -33,9 +36,30 @@ class _SuperSocket_metaclass(type):
             return "<%s>" % self.__name__
 
 
+# Used to get ancillary data
+PACKET_AUXDATA = 8
+ETH_P_8021Q = 0x8100
+TP_STATUS_VLAN_VALID = 1 << 4
+
+
+class tpacket_auxdata(ctypes.Structure):
+    _fields_ = [
+        ("tp_status", ctypes.c_uint),
+        ("tp_len", ctypes.c_uint),
+        ("tp_snaplen", ctypes.c_uint),
+        ("tp_mac", ctypes.c_ushort),
+        ("tp_net", ctypes.c_ushort),
+        ("tp_vlan_tci", ctypes.c_ushort),
+        ("tp_padding", ctypes.c_ushort),
+    ]
+
+
+# SuperSocket
+
 class SuperSocket(six.with_metaclass(_SuperSocket_metaclass)):
     desc = None
     closed = 0
+    nonblocking_socket = False
     read_allowed_exceptions = ()
 
     def __init__(self, family=socket.AF_INET, type=socket.SOCK_STREAM, proto=0):  # noqa: E501
@@ -45,9 +69,53 @@ class SuperSocket(six.with_metaclass(_SuperSocket_metaclass)):
 
     def send(self, x):
         sx = raw(x)
-        if hasattr(x, "sent_time"):
+        try:
             x.sent_time = time.time()
+        except AttributeError:
+            pass
         return self.outs.send(sx)
+
+    if six.PY2:
+        def _recv_raw(self, sock, x):
+            """Internal function to receive a Packet"""
+            pkt, sa_ll = sock.recvfrom(x)
+            return pkt, sa_ll, None
+    else:
+        def _recv_raw(self, sock, x):
+            """Internal function to receive a Packet,
+            and process ancillary data.
+            """
+            flags_len = socket.CMSG_LEN(4096)
+            timestamp = None
+            pkt, ancdata, flags, sa_ll = sock.recvmsg(x, flags_len)
+            if not pkt:
+                return pkt, sa_ll
+            for cmsg_lvl, cmsg_type, cmsg_data in ancdata:
+                # Check available ancillary data
+                if (cmsg_lvl == SOL_PACKET and cmsg_type == PACKET_AUXDATA):
+                    # Parse AUXDATA
+                    auxdata = tpacket_auxdata.from_buffer_copy(cmsg_data)
+                    if auxdata.tp_vlan_tci != 0 or \
+                            auxdata.tp_status & TP_STATUS_VLAN_VALID:
+                        # Insert VLAN tag
+                        tag = struct.pack(
+                            "!HH",
+                            ETH_P_8021Q,
+                            auxdata.tp_vlan_tci
+                        )
+                        pkt = pkt[:12] + tag + pkt[12:]
+                elif cmsg_lvl == socket.SOL_SOCKET and \
+                        cmsg_type == SO_TIMESTAMPNS:
+                    length = len(cmsg_data)
+                    if length == 16:  # __kernel_timespec
+                        tmp = struct.unpack("ll", cmsg_data)
+                    elif length == 8:  # timespec
+                        tmp = struct.unpack("ii", cmsg_data)
+                    else:
+                        log_runtime.warning("Unknown timespec format.. ?!")
+                        continue
+                    timestamp = tmp[0] + tmp[1] * 1e-9
+            return pkt, sa_ll, timestamp
 
     def recv_raw(self, x=MTU):
         """Returns a tuple containing (cls, pkt_data, time)"""
@@ -63,9 +131,12 @@ class SuperSocket(six.with_metaclass(_SuperSocket_metaclass)):
             raise
         except Exception:
             if conf.debug_dissector:
+                from scapy.sendrecv import debug
+                debug.crashed_on = (cls, val)
                 raise
             pkt = conf.raw_layer(val)
-        pkt.time = ts
+        if ts:
+            pkt.time = ts
         return pkt
 
     def fileno(self):
@@ -75,12 +146,12 @@ class SuperSocket(six.with_metaclass(_SuperSocket_metaclass)):
         if self.closed:
             return
         self.closed = True
-        if hasattr(self, "outs"):
-            if not hasattr(self, "ins") or self.ins != self.outs:
-                if self.outs and self.outs.fileno() != -1:
+        if getattr(self, "outs", None):
+            if getattr(self, "ins", None) != self.outs:
+                if WINDOWS or self.outs.fileno() != -1:
                     self.outs.close()
-        if hasattr(self, "ins"):
-            if self.ins and self.ins.fileno() != -1:
+        if getattr(self, "ins", None):
+            if WINDOWS or self.ins.fileno() != -1:
                 self.ins.close()
 
     def sr(self, *args, **kargs):
@@ -99,16 +170,18 @@ class SuperSocket(six.with_metaclass(_SuperSocket_metaclass)):
         from scapy import sendrecv
         return sendrecv.sniff(opened_socket=self, *args, **kargs)
 
+    def tshark(self, *args, **kargs):
+        from scapy import sendrecv
+        return sendrecv.tshark(opened_socket=self, *args, **kargs)
+
     @staticmethod
     def select(sockets, remain=conf.recv_poll_rate):
         """This function is called during sendrecv() routine to select
         the available sockets.
 
-        params:
-         - sockets: an array of sockets that need to be selected
-        returns:
-         - an array of sockets that were selected
-         - the function to be called next to get the packets (i.g. recv)
+        :param sockets: an array of sockets that need to be selected
+        :returns: an array of sockets that were selected and
+            the function to be called next to get the packets (i.g. recv)
         """
         try:
             inp, _, _ = select(sockets, [], [], remain)
@@ -139,9 +212,17 @@ class L3RawSocket(SuperSocket):
         self.ins = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(type))  # noqa: E501
         if iface is not None:
             self.ins.bind((iface, type))
+        if not six.PY2:
+            # Receive Auxiliary Data (VLAN tags)
+            self.ins.setsockopt(SOL_PACKET, PACKET_AUXDATA, 1)
+            self.ins.setsockopt(
+                socket.SOL_SOCKET,
+                SO_TIMESTAMPNS,
+                1
+            )
 
     def recv(self, x=MTU):
-        pkt, sa_ll = self.ins.recvfrom(x)
+        pkt, sa_ll, ts = self._recv_raw(self.ins, x)
         if sa_ll[2] == socket.PACKET_OUTGOING:
             return None
         if sa_ll[3] in conf.l2types:
@@ -167,15 +248,17 @@ class L3RawSocket(SuperSocket):
             pkt = pkt.payload
 
         if pkt is not None:
-            from scapy.arch import get_last_packet_timestamp
-            pkt.time = get_last_packet_timestamp(self.ins)
+            if ts is None:
+                from scapy.arch import get_last_packet_timestamp
+                ts = get_last_packet_timestamp(self.ins)
+            pkt.time = ts
         return pkt
 
     def send(self, x):
         try:
             sx = raw(x)
             x.sent_time = time.time()
-            self.outs.sendto(sx, (x.dst, 0))
+            return self.outs.sendto(sx, (x.dst, 0))
         except socket.error as msg:
             log_runtime.error(msg)
 
@@ -190,6 +273,7 @@ class SimpleSocket(SuperSocket):
 
 class StreamSocket(SimpleSocket):
     desc = "transforms a stream socket into a layer 2"
+    nonblocking_socket = True
 
     def __init__(self, sock, basecls=None):
         if basecls is None:
@@ -201,7 +285,7 @@ class StreamSocket(SimpleSocket):
         pkt = self.ins.recv(x, socket.MSG_PEEK)
         x = len(pkt)
         if x == 0:
-            raise socket.error((100, "Underlying stream socket tore down"))
+            return None
         pkt = self.basecls(pkt)
         pad = pkt.getlayer(conf.padding_layer)
         if pad is not None and pad.underlayer is not None:
@@ -296,7 +380,7 @@ class TunTapInterface(SuperSocket):
 
     def __init__(self, iface=None, mode_tun=None, *arg, **karg):
         self.iface = conf.iface if iface is None else iface
-        self.mode_tun = ("tun" in iface) if mode_tun is None else mode_tun
+        self.mode_tun = ("tun" in self.iface) if mode_tun is None else mode_tun
         self.closed = True
         self.open()
 
@@ -315,7 +399,8 @@ class TunTapInterface(SuperSocket):
             # IFF_TAP = 0x0002
             # IFF_NO_PI = 0x1000
             ioctl(self.ins, 0x400454ca, struct.pack(
-                "16sH", raw(self.iface), 0x0001 if self.mode_tun else 0x1002,
+                "16sH", bytes_encode(self.iface),
+                0x0001 if self.mode_tun else 0x1002,
             ))
         self.closed = False
 
@@ -337,8 +422,6 @@ conf.L2listen, conf.L2socket or conf.L3socket.
 
     def send(self, x):
         sx = raw(x)
-        if hasattr(x, "sent_time"):
-            x.sent_time = time.time()
         if self.mode_tun:
             try:
                 proto = conf.l3types[type(x)]
@@ -351,6 +434,10 @@ conf.L2listen, conf.L2socket or conf.L3socket.
                 proto = 0
             sx = struct.pack('!HH', 0, proto) + sx
         try:
-            os.write(self.outs.fileno(), sx)
+            try:
+                x.sent_time = time.time()
+            except AttributeError:
+                pass
+            return os.write(self.outs.fileno(), sx)
         except socket.error:
             log_runtime.error("%s send", self.__class__.__name__, exc_info=True)  # noqa: E501

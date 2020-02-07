@@ -27,6 +27,7 @@ import scapy.modules.six as six
 
 if conf.crypto_valid:
     from cryptography.hazmat.backends import default_backend
+    from cryptography.hazmat.primitives import serialization
     from cryptography.hazmat.primitives.asymmetric import dh, ec
 
 
@@ -48,11 +49,10 @@ _tls_hash_sig = {0x0000: "none+anon", 0x0001: "none+rsa",
                  0x0502: "sha384+dsa", 0x0503: "sha384+ecdsa",
                  0x0600: "sha512+anon", 0x0601: "sha512+rsa",
                  0x0602: "sha512+dsa", 0x0603: "sha512+ecdsa",
-                 0x0804: "sha256+rsapss",
-                 0x0805: "sha384+rsapss",
-                 0x0806: "sha512+rsapss",
-                 0x0807: "ed25519",
-                 0x0808: "ed448"}
+                 0x0804: "sha256+rsaepss", 0x0805: "sha384+rsaepss",
+                 0x0806: "sha512+rsaepss", 0x0807: "ed25519",
+                 0x0808: "ed448", 0x0809: "sha256+rsapss",
+                 0x080a: "sha384+rsapss", 0x080b: "sha512+rsapss"}
 
 
 def phantom_mode(pkt):
@@ -163,9 +163,13 @@ class _TLSSignature(_GenericTLSSessionInheritance):
     def __init__(self, *args, **kargs):
         super(_TLSSignature, self).__init__(*args, **kargs)
         if (self.tls_session and
-            self.tls_session.tls_version and
-                self.tls_session.tls_version < 0x0303):
-            self.sig_alg = None
+                self.tls_session.tls_version):
+            if self.tls_session.tls_version < 0x0303:
+                self.sig_alg = None
+            elif self.tls_session.tls_version == 0x0304:
+                # For TLS 1.3 signatures, set the signature
+                # algorithm to RSA-PSS
+                self.sig_alg = 0x0804
 
     def _update_sig(self, m, key):
         """
@@ -234,7 +238,7 @@ class _TLSSignatureField(PacketField):
         remain = b""
         if conf.padding_layer in i:
             r = i[conf.padding_layer]
-            del(r.underlayer.payload)
+            del r.underlayer.payload
             remain = r.load
         return remain, i
 
@@ -585,7 +589,15 @@ class ServerECDHNamedCurveParams(_GenericTLSSessionInheritance):
 
         if self.point is None:
             pubkey = s.server_kx_privkey.public_key()
-            self.point = pubkey.public_numbers().encode_point()
+            try:
+                # cryptography >= 2.5
+                self.point = pubkey.public_bytes(
+                    serialization.Encoding.X962,
+                    serialization.PublicFormat.UncompressedPoint
+                )
+            except TypeError:
+                # older versions
+                self.key_exchange = pubkey.public_numbers().encode_point()
         # else, we assume that the user wrote the server_kx_privkey by himself
         if self.pointlen is None:
             self.pointlen = len(self.point)

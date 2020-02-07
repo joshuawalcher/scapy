@@ -1,5 +1,3 @@
-#! /usr/bin/env python
-
 # scapy.contrib.description = Skinny Call Control Protocol (SCCP)
 # scapy.contrib.status = loads
 
@@ -419,8 +417,8 @@ _skinny_codecs = {
 }
 
 _skinny_echo = {
-    0x0: 'echo cancelation off',
-    0x1: 'echo cancelation on'
+    0x0: 'echo cancellation off',
+    0x1: 'echo cancellation on'
 }
 
 

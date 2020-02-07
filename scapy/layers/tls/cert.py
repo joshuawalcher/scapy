@@ -15,12 +15,14 @@ of a Cert instance after its serial has been modified (for example).
 If you need to modify an import, just use the corresponding ASN1_Packet.
 
 For instance, here is what you could do in order to modify the serial of
-'cert' and then resign it with whatever 'key':
+'cert' and then resign it with whatever 'key'::
+
     f = open('cert.der')
     c = X509_Cert(f.read())
     c.tbsCertificate.serialNumber = 0x4B1D
     k = PrivKey('key.pem')
     new_x509_cert = k.resignCert(c)
+
 No need for obnoxious openssl tweaking anymore. :)
 """
 
@@ -44,12 +46,11 @@ from scapy.layers.x509 import (X509_SubjectPublicKeyInfo,
                                X509_Cert, X509_CRL)
 from scapy.layers.tls.crypto.pkcs1 import pkcs_os2ip, _get_hash, \
     _EncryptAndVerifyRSA, _DecryptAndSignRSA
-from scapy.compat import raw
+from scapy.compat import raw, bytes_encode
 if conf.crypto_valid:
     from cryptography.hazmat.backends import default_backend
     from cryptography.hazmat.primitives import serialization
     from cryptography.hazmat.primitives.asymmetric import rsa, ec
-if conf.crypto_valid_recent:
     from cryptography.hazmat.backends.openssl.ec import InvalidSignature
 
 
@@ -132,7 +133,7 @@ class _PKIObjMaker(type):
 
         if obj_path is None:
             raise Exception(error_msg)
-        obj_path = raw(obj_path)
+        obj_path = bytes_encode(obj_path)
 
         if (b'\x00' not in obj_path) and os.path.isfile(obj_path):
             _size = os.path.getsize(obj_path)
@@ -298,10 +299,11 @@ class PubKeyRSA(PubKey, _EncryptAndVerifyRSA):
 
     def encrypt(self, msg, t="pkcs", h="sha256", mgf=None, L=None):
         # no ECDSA encryption support, hence no ECDSA specific keywords here
-        return _EncryptAndVerifyRSA.encrypt(self, msg, t, h, mgf, L)
+        return _EncryptAndVerifyRSA.encrypt(self, msg, t=t, h=h, mgf=mgf, L=L)
 
     def verify(self, msg, sig, t="pkcs", h="sha256", mgf=None, L=None):
-        return _EncryptAndVerifyRSA.verify(self, msg, sig, t, h, mgf, L)
+        return _EncryptAndVerifyRSA.verify(
+            self, msg, sig, t=t, h=h, mgf=mgf, L=L)
 
 
 class PubKeyECDSA(PubKey):
@@ -328,16 +330,11 @@ class PubKeyECDSA(PubKey):
     @crypto_validator
     def verify(self, msg, sig, h="sha256", **kwargs):
         # 'sig' should be a DER-encoded signature, as per RFC 3279
-        if conf.crypto_valid_recent:
-            try:
-                self.pubkey.verify(sig, msg, ec.ECDSA(_get_hash(h)))
-                return True
-            except InvalidSignature:
-                return False
-        else:
-            verifier = self.pubkey.verifier(sig, ec.ECDSA(_get_hash(h)))
-            verifier.update(msg)
-            return verifier.verify()
+        try:
+            self.pubkey.verify(sig, msg, ec.ECDSA(_get_hash(h)))
+            return True
+        except InvalidSignature:
+            return False
 
 
 ################
@@ -407,6 +404,13 @@ class _PrivKeyFactory(_PKIObjMaker):
         return obj
 
 
+class _Raw_ASN1_BIT_STRING(ASN1_BIT_STRING):
+    """A ASN1_BIT_STRING that ignores BER encoding"""
+    def __bytes__(self):
+        return self.val_readable
+    __str__ = __bytes__
+
+
 class PrivKey(six.with_metaclass(_PrivKeyFactory, object)):
     """
     Parent class for both PrivKeyRSA and PrivKeyECDSA.
@@ -433,7 +437,7 @@ class PrivKey(six.with_metaclass(_PrivKeyFactory, object)):
         c = X509_Cert()
         c.tbsCertificate = tbsCert
         c.signatureAlgorithm = sigAlg
-        c.signatureValue = ASN1_BIT_STRING(sigVal, readable=True)
+        c.signatureValue = _Raw_ASN1_BIT_STRING(sigVal, readable=True)
         return c
 
     def resignCert(self, cert):
@@ -503,10 +507,11 @@ class PrivKeyRSA(PrivKey, _EncryptAndVerifyRSA, _DecryptAndSignRSA):
 
     def verify(self, msg, sig, t="pkcs", h="sha256", mgf=None, L=None):
         # Let's copy this from PubKeyRSA instead of adding another baseclass :)
-        return _EncryptAndVerifyRSA.verify(self, msg, sig, t, h, mgf, L)
+        return _EncryptAndVerifyRSA.verify(
+            self, msg, sig, t=t, h=h, mgf=mgf, L=L)
 
     def sign(self, data, t="pkcs", h="sha256", mgf=None, L=None):
-        return _DecryptAndSignRSA.sign(self, data, t, h, mgf, L)
+        return _DecryptAndSignRSA.sign(self, data, t=t, h=h, mgf=mgf, L=L)
 
 
 class PrivKeyECDSA(PrivKey):
@@ -529,25 +534,15 @@ class PrivKeyECDSA(PrivKey):
     @crypto_validator
     def verify(self, msg, sig, h="sha256", **kwargs):
         # 'sig' should be a DER-encoded signature, as per RFC 3279
-        if conf.crypto_valid_recent:
-            try:
-                self.pubkey.verify(sig, msg, ec.ECDSA(_get_hash(h)))
-                return True
-            except InvalidSignature:
-                return False
-        else:
-            verifier = self.pubkey.verifier(sig, ec.ECDSA(_get_hash(h)))
-            verifier.update(msg)
-            return verifier.verify()
+        try:
+            self.pubkey.verify(sig, msg, ec.ECDSA(_get_hash(h)))
+            return True
+        except InvalidSignature:
+            return False
 
     @crypto_validator
     def sign(self, data, h="sha256", **kwargs):
-        if conf.crypto_valid_recent:
-            return self.key.sign(data, ec.ECDSA(_get_hash(h)))
-        else:
-            signer = self.key.signer(ec.ECDSA(_get_hash(h)))
-            signer.update(data)
-            return signer.finalize()
+        return self.key.sign(data, ec.ECDSA(_get_hash(h)))
 
 
 ################
@@ -604,7 +599,8 @@ class Cert(six.with_metaclass(_CertMaker, object)):
         if notBefore[-1] == "Z":
             notBefore = notBefore[:-1]
         try:
-            self.notBefore = time.strptime(notBefore, "%y%m%d%H%M%S")
+            _format = tbsCert.validity.not_before._format
+            self.notBefore = time.strptime(notBefore, _format)
         except Exception:
             raise Exception(error_msg)
         self.notBefore_str_simple = time.strftime("%x", self.notBefore)
@@ -614,7 +610,8 @@ class Cert(six.with_metaclass(_CertMaker, object)):
         if notAfter[-1] == "Z":
             notAfter = notAfter[:-1]
         try:
-            self.notAfter = time.strptime(notAfter, "%y%m%d%H%M%S")
+            _format = tbsCert.validity.not_after._format
+            self.notAfter = time.strptime(notAfter, _format)
         except Exception:
             raise Exception(error_msg)
         self.notAfter_str_simple = time.strftime("%x", self.notAfter)
@@ -659,10 +656,10 @@ class Cert(six.with_metaclass(_CertMaker, object)):
 
     def encrypt(self, msg, t="pkcs", h="sha256", mgf=None, L=None):
         # no ECDSA *encryption* support, hence only RSA specific keywords here
-        return self.pubKey.encrypt(msg, t, h, mgf, L)
+        return self.pubKey.encrypt(msg, t=t, h=h, mgf=mgf, L=L)
 
     def verify(self, msg, sig, t="pkcs", h="sha256", mgf=None, L=None):
-        return self.pubKey.verify(msg, sig, t, h, mgf, L)
+        return self.pubKey.verify(msg, sig, t=t, h=h, mgf=mgf, L=L)
 
     def remainingDays(self, now=None):
         """
@@ -992,26 +989,3 @@ class Chain(list):
                 s += "\n"
             idx += 1
         return s
-
-
-##############################
-# Certificate export helpers #
-##############################
-
-def _create_ca_file(anchor_list, filename):
-    """
-    Concatenate all the certificates (PEM format for the export) in
-    'anchor_list' and write the result to file 'filename'. On success
-    'filename' is returned, None otherwise.
-
-    If you are used to OpenSSL tools, this function builds a CAfile
-    that can be used for certificate and CRL check.
-    """
-    try:
-        with open(filename, "w") as f:
-            for a in anchor_list:
-                s = a.output(fmt="PEM")
-                f.write(s)
-    except IOError:
-        return None
-    return filename

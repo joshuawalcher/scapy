@@ -27,14 +27,16 @@ import scapy.utils
 import scapy.utils6
 from scapy.packet import Packet, Padding
 from scapy.config import conf
-from scapy.data import MTU, ETH_P_ALL
+from scapy.data import MTU, ETH_P_ALL, SOL_PACKET, SO_ATTACH_FILTER, \
+    SO_TIMESTAMPNS
 from scapy.supersocket import SuperSocket
-from scapy.error import warning, Scapy_Exception, log_interactive, \
-    log_loading, ScapyInvalidPlatformException
-from scapy.arch.common import get_if, get_bpf_pointer
+from scapy.error import warning, Scapy_Exception, \
+    ScapyInvalidPlatformException
+from scapy.arch.common import get_if, compile_filter
 import scapy.modules.six as six
 from scapy.modules.six.moves import range
 
+from scapy.arch.common import get_if_raw_hwaddr  # noqa: F401
 
 # From bits/ioctls.h
 SIOCGIFHWADDR = 0x8927          # Get hardware address
@@ -70,11 +72,6 @@ PACKET_MR_MULTICAST = 0
 PACKET_MR_PROMISC = 1
 PACKET_MR_ALLMULTI = 2
 
-# From bits/socket.h
-SOL_PACKET = 263
-# From asm/socket.h
-SO_ATTACH_FILTER = 26
-
 # From net/route.h
 RTF_UP = 0x0001  # Route usable
 RTF_REJECT = 0x0200
@@ -88,21 +85,11 @@ PACKET_OUTGOING = 4  # Outgoing of any type
 PACKET_LOOPBACK = 5  # MC/BRD frame looped back
 PACKET_USER = 6  # To user space
 PACKET_KERNEL = 7  # To kernel space
+PACKET_AUXDATA = 8
 PACKET_FASTROUTE = 6  # Fastrouted frame
 # Unused, PACKET_FASTROUTE and PACKET_LOOPBACK are invisible to user space
 
-
-with os.popen("%s -V 2> /dev/null" % conf.prog.tcpdump) as _f:
-    if _f.close() >> 8 == 0x7f:
-        log_loading.warning("Failed to execute tcpdump. Check it is installed and in the PATH")  # noqa: E501
-        TCPDUMP = 0
-    else:
-        TCPDUMP = 1
-del(_f)
-
-
-def get_if_raw_hwaddr(iff):
-    return struct.unpack("16xh6s8x", get_if(iff, SIOCGIFHWADDR))
+# Utils
 
 
 def get_if_raw_addr(iff):
@@ -130,6 +117,9 @@ def get_if_list():
 
 
 def get_working_if():
+    """
+    Return the name of the first network interfcace that is up.
+    """
     for i in get_if_list():
         if i == LOOPBACK_NAME:
             continue
@@ -139,36 +129,15 @@ def get_working_if():
     return LOOPBACK_NAME
 
 
-def attach_filter(s, bpf_filter, iface):
+def attach_filter(sock, bpf_filter, iface):
     # XXX We generate the filter on the interface conf.iface
     # because tcpdump open the "any" interface and ppp interfaces
     # in cooked mode. As we use them in raw mode, the filter will not
     # work... one solution could be to use "any" interface and translate
     # the filter from cooked mode to raw mode
     # mode
-    if not TCPDUMP:
-        return
-    try:
-        f = os.popen("%s -p -i %s -ddd -s %d '%s'" % (
-            conf.prog.tcpdump,
-            conf.iface if iface is None else iface,
-            MTU,
-            bpf_filter,
-        ))
-    except OSError:
-        log_interactive.warning("Failed to attach filter.",
-                                exc_info=True)
-        return
-    lines = f.readlines()
-    ret = f.close()
-    if ret:
-        log_interactive.warning(
-            "Failed to attach filter: tcpdump returned %d", ret
-        )
-        return
-
-    bp = get_bpf_pointer(lines)
-    s.setsockopt(socket.SOL_SOCKET, SO_ATTACH_FILTER, bp)
+    bp = compile_filter(bpf_filter, iface)
+    sock.setsockopt(socket.SOL_SOCKET, SO_ATTACH_FILTER, bp)
 
 
 def set_promisc(s, iff, val=1):
@@ -307,7 +276,7 @@ def in6_getifaddr():
     """
     Returns a list of 3-tuples of the form (addr, scope, iface) where
     'addr' is the address of scope 'scope' associated to the interface
-    'ifcace'.
+    'iface'.
 
     This is the list of all addresses of all interfaces available on
     the system.
@@ -349,16 +318,16 @@ def read_routes6():
     routes = []
 
     def proc2r(p):
-        ret = struct.unpack('4s4s4s4s4s4s4s4s', raw(p))
+        ret = struct.unpack('4s4s4s4s4s4s4s4s', p)
         ret = b':'.join(ret).decode()
         return scapy.utils6.in6_ptop(ret)
 
     lifaddr = in6_getifaddr()
     for line in f.readlines():
-        line = plain_str(line)
-        d, dp, s, sp, nh, metric, rc, us, fl, dev = line.split()
+        d, dp, _, _, nh, metric, rc, us, fl, dev = line.split()
         metric = int(metric, 16)
         fl = int(fl, 16)
+        dev = plain_str(dev)
 
         if fl & RTF_UP == 0:
             continue
@@ -367,8 +336,6 @@ def read_routes6():
 
         d = proc2r(d)
         dp = int(dp, 16)
-        s = proc2r(s)
-        sp = int(sp, 16)
         nh = proc2r(nh)
 
         cset = []  # candidate set (possible source addresses)
@@ -452,13 +419,13 @@ def set_iface_monitor(iface, monitor):
             warning("%s failed !" % " ".join(commands))
             return False
         return True
-    try:
-        assert _check_call(["ifconfig", iface, "down"])
-        assert _check_call(["iwconfig", iface, "mode", s_mode])
-        assert _check_call(["ifconfig", iface, "up"])
-        return True
-    except AssertionError:
+    if not _check_call(["ifconfig", iface, "down"]):
         return False
+    if not _check_call(["iwconfig", iface, "mode", s_mode]):
+        return False
+    if not _check_call(["ifconfig", iface, "up"]):
+        return False
+    return True
 
 
 class L2Socket(SuperSocket):
@@ -468,11 +435,13 @@ class L2Socket(SuperSocket):
                  nofilter=0, monitor=None):
         self.iface = conf.iface if iface is None else iface
         self.type = type
+        self.promisc = conf.sniff_promisc if promisc is None else promisc
         if monitor is not None:
-            if not set_iface_monitor(iface, monitor):
-                warning("Could not change interface mode !")
+            warning(
+                "The monitor argument is ineffective on native linux sockets."
+                " Use set_iface_monitor instead."
+            )
         self.ins = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(type))  # noqa: E501
-        self.ins.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 0)
         if not nofilter:
             if conf.except_filter:
                 if filter:
@@ -481,17 +450,32 @@ class L2Socket(SuperSocket):
                     filter = "not (%s)" % conf.except_filter
             if filter is not None:
                 attach_filter(self.ins, filter, iface)
-        self.promisc = conf.sniff_promisc if promisc is None else promisc
         if self.promisc:
             set_promisc(self.ins, self.iface)
         self.ins.bind((self.iface, type))
         _flush_fd(self.ins)
-        self.ins.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 2**30)
+        self.ins.setsockopt(
+            socket.SOL_SOCKET,
+            socket.SO_RCVBUF,
+            conf.bufsize
+        )
+        if not six.PY2:
+            # Receive Auxiliary Data (VLAN tags)
+            self.ins.setsockopt(SOL_PACKET, PACKET_AUXDATA, 1)
+            self.ins.setsockopt(
+                socket.SOL_SOCKET,
+                SO_TIMESTAMPNS,
+                1
+            )
         if isinstance(self, L2ListenSocket):
             self.outs = None
         else:
             self.outs = self.ins
-            self.outs.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 2**30)
+            self.outs.setsockopt(
+                socket.SOL_SOCKET,
+                socket.SO_SNDBUF,
+                conf.bufsize
+            )
         sa_ll = self.ins.getsockname()
         if sa_ll[3] in conf.l2types:
             self.LL = conf.l2types[sa_ll[3]]
@@ -507,16 +491,20 @@ class L2Socket(SuperSocket):
     def close(self):
         if self.closed:
             return
-        if self.promisc:
-            set_promisc(self.ins, self.iface, 0)
+        try:
+            if self.promisc and self.ins:
+                set_promisc(self.ins, self.iface, 0)
+        except AttributeError:
+            pass
         SuperSocket.close(self)
 
     def recv_raw(self, x=MTU):
         """Receives a packet, then returns a tuple containing (cls, pkt_data, time)"""  # noqa: E501
-        pkt, sa_ll = self.ins.recvfrom(x)
+        pkt, sa_ll, ts = self._recv_raw(self.ins, x)
         if self.outs and sa_ll[2] == socket.PACKET_OUTGOING:
             return None, None, None
-        ts = get_last_packet_timestamp(self.ins)
+        if ts is None:
+            ts = get_last_packet_timestamp(self.ins)
         return self.LL, pkt, ts
 
     def send(self, x):
@@ -545,11 +533,12 @@ class L3PacketSocket(L2Socket):
     def recv(self, x=MTU):
         pkt = SuperSocket.recv(self, x)
         if pkt and self.lvl == 2:
-            pkt = pkt.payload
+            pkt.payload.time = pkt.time
+            return pkt.payload
         return pkt
 
     def send(self, x):
-        iff, a, gw = x.route()
+        iff = x.route()[0]
         if iff is None:
             iff = conf.iface
         sdto = (iff, self.type)
@@ -605,14 +594,14 @@ class VEthPair(object):
     def destroy(self):
         """
         remove veth pair links
-        :raises subprocess.CalledProcessError if operation failes
+        :raises subprocess.CalledProcessError if operation fails
         """
         subprocess.check_call(['ip', 'link', 'del', self.ifaces[0]])
 
     def up(self):
         """
         set veth pair links up
-        :raises subprocess.CalledProcessError if operation failes
+        :raises subprocess.CalledProcessError if operation fails
         """
         for idx in [0, 1]:
             subprocess.check_call(["ip", "link", "set", self.ifaces[idx], "up"])  # noqa: E501
@@ -620,7 +609,7 @@ class VEthPair(object):
     def down(self):
         """
         set veth pair links down
-        :raises subprocess.CalledProcessError if operation failes
+        :raises subprocess.CalledProcessError if operation fails
         """
         for idx in [0, 1]:
             subprocess.check_call(["ip", "link", "set", self.ifaces[idx], "down"])  # noqa: E501
